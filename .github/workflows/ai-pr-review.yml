@@ -1,0 +1,167 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff and run AI Review
+        id: review
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL || 'gpt-5.6-luna' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ---- Step 1: 获取 PR diff ----
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          echo "Base SHA: $BASE_SHA"
+          echo "Head SHA: $HEAD_SHA"
+
+          # 生成 diff 文件
+          {
+            echo "📁 **文件修改统计**"
+            echo '```'
+            git diff --stat "$BASE_SHA"..."$HEAD_SHA"
+            echo '```'
+            echo ""
+            echo "📝 **完整 Diff（仅前 3000 行）**"
+            echo '```diff'
+            git diff "$BASE_SHA"..."$HEAD_SHA" | head -n 3000
+            echo '```'
+          } > /tmp/pr_diff.md
+
+          # ---- Step 2: 构造 API 请求 ----
+          python3 << 'PYEOF'
+import json, os, sys, subprocess, urllib.request
+
+# 读取 diff 内容
+with open('/tmp/pr_diff.md', 'r') as f:
+    diff_content = f.read()
+
+# 读取环境变量
+base_url = os.environ.get('ANTHROPIC_BASE_URL', '').rstrip('/')
+auth_token = os.environ.get('ANTHROPIC_AUTH_TOKEN', '')
+model = os.environ.get('ANTHROPIC_MODEL', 'gpt-5.6-luna')
+
+if not base_url or not auth_token:
+    comment = (
+        "## 🤖 AI Code Review\n\n"
+        "### ⚠️ 配置错误\n\n"
+        "请设置以下 GitHub Secrets：\n"
+        "- `ANTHROPIC_BASE_URL` — API 地址\n"
+        "- `ANTHROPIC_AUTH_TOKEN` — API 密钥\n"
+        "- `ANTHROPIC_MODEL` — 模型名称（可选，默认 gpt-5.6-luna）\n"
+    )
+    with open('/tmp/review_comment.md', 'w') as f:
+        f.write(comment)
+    sys.exit(0)
+
+# 构造 system prompt
+system_prompt = (
+    "你是一个资深的代码审查专家，擅长审查 Pull Request 的代码变更。"
+    "请用中文回答，输出结构化的 Markdown 格式审查报告。"
+)
+
+# 构造 user prompt
+user_prompt = f"""你是一个资深的代码审查专家。请对以下 Pull Request 的代码变更进行审查。
+
+请从以下几个方面进行分析：
+
+1. **代码质量**：是否存在潜在错误、bug 或逻辑问题？
+2. **安全性**：是否存在安全漏洞（如注入、敏感信息泄露等）？
+3. **性能**：是否存在性能问题？
+4. **可维护性**：代码风格、命名、注释是否合理？是否遵循最佳实践？
+5. **改进建议**：给出具体的改进建议。
+
+---
+以下是 PR 的代码变更 diff：
+{diff_content}
+---
+
+请以 Markdown 格式输出审查结果，使用适当的标题、列表和代码块。
+"""
+
+# 构造请求 payload
+payload = {
+    "model": model,
+    "max_tokens": 4096,
+    "system": system_prompt,
+    "messages": [
+        {"role": "user", "content": user_prompt}
+    ]
+}
+
+# 发送请求
+req_data = json.dumps(payload).encode('utf-8')
+req = urllib.request.Request(
+    f"{base_url}/v1/messages",
+    data=req_data,
+    headers={
+        "Content-Type": "application/json",
+        "x-api-key": auth_token,
+        "anthropic-version": "2023-06-01"
+    },
+    method="POST"
+)
+
+try:
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        response_data = json.loads(resp.read().decode('utf-8'))
+
+    # 提取文本内容
+    review_text = ""
+    for block in response_data.get("content", []):
+        if block.get("type") == "text":
+            review_text += block.get("text", "")
+
+    comment = f"## 🤖 AI Code Review\n\n{review_text}"
+
+except urllib.error.HTTPError as e:
+    error_body = e.read().decode('utf-8')
+    comment = (
+        f"## 🤖 AI Review Failed\n\n"
+        f"AI 代码审查 API 调用失败。\n\n"
+        f"**HTTP 状态码**: {e.code}\n\n"
+        f"**错误详情**:\n```\n{error_body}\n```\n"
+    )
+except urllib.error.URLError as e:
+    comment = (
+        f"## 🤖 AI Review Failed\n\n"
+        f"无法连接到 API 服务。\n\n"
+        f"**错误**: {str(e.reason)}\n\n"
+        f"请检查 `ANTHROPIC_BASE_URL` 是否正确。\n"
+    )
+
+# 保存评论内容
+with open('/tmp/review_comment.md', 'w') as f:
+    f.write(comment)
+
+print("Review comment generated successfully")
+PYEOF
+
+      - name: Post Review Comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          gh pr comment "$PR_NUMBER" --body-file /tmp/review_comment.md
+          echo "✅ AI Review comment posted to PR #$PR_NUMBER"
